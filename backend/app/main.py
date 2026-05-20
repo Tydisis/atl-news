@@ -7,22 +7,58 @@ from typing import get_args
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-from .fetcher import FeedCache
+import asyncio
+
+from .config import get_settings
+from .fetcher import fetch_all
 from .models import Category, FeedResponse, SourceInfo
 from .sources import SOURCES
+from .store import make_store
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+logger = logging.getLogger("atl-news.api")
 
 VALID_CATEGORIES: tuple[str, ...] = get_args(Category)
 
 
+async def _memory_refresh_loop(store, interval: int) -> None:
+    while True:
+        try:
+            articles = await fetch_all()
+            if articles:
+                await store.put_articles(articles)
+                logger.info("memory store refreshed: %d articles", len(articles))
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("background refresh failed: %s", exc)
+        await asyncio.sleep(interval)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    app.state.cache = FeedCache()
-    yield
+    settings = get_settings()
+    app.state.settings = settings
+    app.state.store = make_store(settings)
+    refresh_task: asyncio.Task | None = None
+    if settings.store_backend == "memory":
+        articles = await fetch_all()
+        await app.state.store.put_articles(articles)
+        logger.info("memory store seeded with %d articles", len(articles))
+        refresh_task = asyncio.create_task(
+            _memory_refresh_loop(app.state.store, settings.memory_refresh_interval_seconds)
+        )
+    logger.info("api ready (store=%s)", settings.store_backend)
+    try:
+        yield
+    finally:
+        if refresh_task is not None:
+            refresh_task.cancel()
+            try:
+                await refresh_task
+            except asyncio.CancelledError:
+                pass
 
 
-app = FastAPI(title="atl-news", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="atl-news", version="0.2.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -35,6 +71,14 @@ app.add_middleware(
 @app.get("/healthz")
 async def healthz() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/readyz")
+async def readyz() -> dict[str, str]:
+    last = await app.state.store.last_updated()
+    if last is None:
+        raise HTTPException(status_code=503, detail="store has no data yet")
+    return {"status": "ok", "last_updated": last.isoformat()}
 
 
 @app.get("/api/sources", response_model=list[SourceInfo])
@@ -52,14 +96,5 @@ async def get_feed(
             status_code=400,
             detail=f"category must be one of {VALID_CATEGORIES}",
         )
-    articles = await app.state.cache.get_articles()
-    if category:
-        articles = [a for a in articles if a.category == category]
-    articles = articles[:limit]
-    return FeedResponse(count=len(articles), articles=articles)
-
-
-@app.post("/api/refresh", response_model=FeedResponse)
-async def refresh_feed() -> FeedResponse:
-    articles = await app.state.cache.refresh()
+    articles = await app.state.store.get_articles(category=category, limit=limit)
     return FeedResponse(count=len(articles), articles=articles)

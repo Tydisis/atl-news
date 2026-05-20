@@ -27,7 +27,3 @@ export async function fetchFeed(params: { category?: Category; limit?: number } 
   return res.json()
 }
 
-export async function refreshFeed(): Promise<void> {
-  const res = await fetch(`${BASE_URL}/api/refresh`, { method: 'POST' })
-  if (!res.ok) throw new Error(`refresh failed: ${res.status}`)
-}

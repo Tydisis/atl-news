@@ -1,15 +1,27 @@
-FROM python:3.12-slim
+FROM python:3.12-slim AS base
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
 
 WORKDIR /app
 
-COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
 
+FROM base AS deps
+COPY requirements.txt ./
+RUN pip install --prefix=/install -r requirements.txt
+
+
+FROM base AS runtime
+
+RUN groupadd --system --gid 1000 atl && \
+    useradd  --system --uid 1000 --gid atl --home /app atl
+
+COPY --from=deps /install /usr/local
 COPY app ./app
+
+USER atl
 
 EXPOSE 8000
 

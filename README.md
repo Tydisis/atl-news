@@ -1,8 +1,30 @@
 # atl-news
 
-Unified RSS news feed covering Atlanta local news, Georgia state politics, and US national politics. Backend service that polls a curated set of RSS feeds, normalizes them into a single schema, and exposes a JSON API.
+Unified RSS news feed covering Atlanta local news, Georgia state politics, and US national politics.
 
-This first iteration is the **backend only**. A React frontend and EKS manifests will follow.
+A FastAPI read-only API serves articles from a store. A separate fetcher process polls RSS feeds on a schedule, normalizes them into a single schema, and writes to that store. A React + Vite SPA consumes `/api/feed`.
+
+## Architecture
+
+```
+                CloudFront
+              ┌──────┴──────┐
+       /api/* │             │ /
+              ▼             ▼
+            ALB           S3 (SPA)
+              │
+              ▼
+        ECS Fargate ────► DynamoDB ◄──── ECS Fargate (scheduled)
+        api service       articles       fetcher task
+                                         (EventBridge cron)
+```
+
+Same Docker image powers two ECS task definitions:
+
+- `api` (long-running service, behind ALB) → reads from DynamoDB
+- `fetcher` (one-shot scheduled task) → writes to DynamoDB
+
+Local dev uses [DynamoDB Local](https://hub.docker.com/r/amazon/dynamodb-local) via `docker-compose.yml`. The API also supports an in-memory fallback (`STORE_BACKEND=memory`) that fetches on startup with no external deps.
 
 ## Sources
 
@@ -15,20 +37,30 @@ This first iteration is the **backend only**. A React frontend and EKS manifests
 | national | NYT Politics, Washington Post Politics, Politico, NPR Politics | Direct RSS |
 | national | AP Politics | `feeds.apnews.com` is unreliable; sourced via Google News query |
 
-All URLs were verified live before being added to `backend/app/sources.py`.
-
 ## API
 
 | Method | Path | Description |
 | --- | --- | --- |
 | GET | `/healthz` | Liveness probe |
+| GET | `/readyz` | Readiness — 503 until the store has data |
 | GET | `/api/sources` | List configured sources |
 | GET | `/api/feed` | Unified timeline, newest first. Optional `category=local\|state\|national`, `limit=1..500` (default 100) |
-| POST | `/api/refresh` | Force a cache refresh |
 
-Articles are cached in-memory for 5 minutes and deduplicated by URL across sources.
+## Configuration
+
+The backend reads `ATL_*` env vars (see `backend/app/config.py`):
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `ATL_STORE_BACKEND` | `memory` | `memory` or `dynamodb` |
+| `ATL_DYNAMODB_TABLE` | `atl-news-articles` | DynamoDB table name |
+| `ATL_DYNAMODB_ENDPOINT_URL` | (unset) | Override for DynamoDB Local |
+| `ATL_AWS_REGION` | `us-east-1` | AWS region for DynamoDB |
+| `ATL_MEMORY_REFRESH_INTERVAL_SECONDS` | `600` | Background refresh cadence in `memory` mode |
 
 ## Run locally
+
+### Option 1: in-memory (no Docker)
 
 ```bash
 cd backend
@@ -37,25 +69,36 @@ python3 -m venv .venv
 .venv/bin/uvicorn app.main:app --reload --port 8000
 ```
 
-Then:
+The API fetches once at startup and refreshes every 10 minutes.
+
+### Option 2: docker-compose (DynamoDB Local + fetcher + API)
 
 ```bash
-curl http://127.0.0.1:8000/healthz
+docker compose up -d
+curl http://127.0.0.1:8000/readyz
 curl 'http://127.0.0.1:8000/api/feed?limit=5'
-curl 'http://127.0.0.1:8000/api/feed?category=local&limit=10'
 ```
 
-## Run in Docker
+Compose runs the fetcher as a one-shot, then starts the API. To re-fetch, run `docker compose run --rm fetcher`.
+
+### Frontend
 
 ```bash
-cd backend
-docker build -t atl-news-backend .
-docker run --rm -p 8000:8000 atl-news-backend
+cd frontend
+cp .env.example .env.local      # default points at http://127.0.0.1:8000
+npm install
+npm run dev
 ```
+
+## Why ECS, not EKS
+
+For this app — a single read-only HTTP service plus one cron job — EKS adds a $73/mo control-plane fee and operational overhead the workload doesn't justify. ECS Fargate gives the same isolation, scheduling, and rolling-deploy story for a fraction of the cost.
+
+EKS becomes the better choice when you need: a service mesh, multiple teams sharing a cluster, custom CRDs, GPU/Inferentia scheduling, or sustained CPU usage that justifies reserved EC2 nodes. Parallel EKS manifests live under `k8s/` to demonstrate the equivalent topology — they are not deployed by default.
 
 ## Roadmap
 
-- React frontend (Vite + TS) consuming `/api/feed`
-- `docker-compose.yml` for local dev
-- EKS manifests under `k8s/` (Deployment + Service + Ingress via AWS Load Balancer Controller)
-- ECR push + GitHub Actions CI
+- Terraform under `infra/terraform/` (network, ECR, DynamoDB, ECS cluster + services, ALB, CloudFront, S3, EventBridge Scheduler)
+- GitHub Actions: OIDC-based deploys, build → ECR → terraform apply → CloudFront invalidation
+- EKS manifests under `k8s/` (Deployment, CronJob, Service, Ingress, HPA, PDB, ServiceAccount with Pod Identity)
+- CloudWatch dashboard + alarms (fetcher staleness, API 5xx, DDB throttles)
